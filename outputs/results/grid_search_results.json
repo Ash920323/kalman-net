@@ -1,0 +1,100 @@
+{
+  "results": [
+    [
+      0.023633889853954315,
+      {
+        "hidden_size": 16,
+        "num_layers": 1,
+        "lr": 0.0003,
+        "dropout": 0.0,
+        "grad_clip": 0.5,
+        "epochs": 5
+      }
+    ],
+    [
+      0.03205516189336777,
+      {
+        "hidden_size": 16,
+        "num_layers": 1,
+        "lr": 0.0003,
+        "dropout": 0.0,
+        "grad_clip": 1.0,
+        "epochs": 5
+      }
+    ],
+    [
+      0.04441718012094498,
+      {
+        "hidden_size": 16,
+        "num_layers": 1,
+        "lr": 0.0001,
+        "dropout": 0.0,
+        "grad_clip": 0.5,
+        "epochs": 5
+      }
+    ],
+    [
+      0.03683061525225639,
+      {
+        "hidden_size": 16,
+        "num_layers": 1,
+        "lr": 0.0001,
+        "dropout": 0.0,
+        "grad_clip": 1.0,
+        "epochs": 5
+      }
+    ],
+    [
+      0.02651263400912285,
+      {
+        "hidden_size": 16,
+        "num_layers": 2,
+        "lr": 0.0003,
+        "dropout": 0.0,
+        "grad_clip": 0.5,
+        "epochs": 5
+      }
+    ],
+    [
+      0.02816411666572094,
+      {
+        "hidden_size": 16,
+        "num_layers": 2,
+        "lr": 0.0003,
+        "dropout": 0.0,
+        "grad_clip": 1.0,
+        "epochs": 5
+      }
+    ],
+    [
+      0.033901240676641464,
+      {
+        "hidden_size": 16,
+        "num_layers": 2,
+        "lr": 0.0001,
+        "dropout": 0.0,
+        "grad_clip": 0.5,
+        "epochs": 5
+      }
+    ],
+    [
+      0.022032730281352997,
+      {
+        "hidden_size": 16,
+        "num_layers": 2,
+        "lr": 0.0001,
+        "dropout": 0.0,
+        "grad_clip": 1.0,
+        "epochs": 5
+      }
+    ]
+  ],
+  "best": {
+    "hidden_size": 16,
+    "num_layers": 2,
+    "lr": 0.0001,
+    "dropout": 0.0,
+    "grad_clip": 1.0,
+    "epochs": 5
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "hidden": 64,
+  "layers": 2,
+  "act": "relu",
+  "lr": 0.00016523134513864307,
+  "drop": 0.2,
+  "bs": 64,
+  "seq": 200,
+  "opt": "rmsprop",
+  "clip": 1.0
+}
