@@ -21,20 +21,19 @@ matplotlib.use("Agg")  # head-less backend for servers / notebooks
 import matplotlib.pyplot as plt
 import optuna
 
-# ---------------------------------------------------------------------------
-#  Project-local filters ------------------------------------------------------
-# ---------------------------------------------------------------------------
-# NB: util.filter should provide KalmanFilter and ParticleFilter classes.
-from util.filter import KalmanFilter, ParticleFilter  # noqa: E402
+from util.filter import KalmanFilter, ParticleFilter, VectorizedParticleFilter
 
 # -------- paths -------------------------------------------------------------
-OUTPUT_DIR = Path.cwd() / "last_last_test"
+OUTPUT_DIR = Path.cwd() / "outputs/run_25_06_27_3"
 OUTPUT_DIR.mkdir(exist_ok=True)
-DATA_DIR = OUTPUT_DIR / "data_knet"
+DATA_DIR =  Path.cwd() / "data" / "data_knet"
 DATA_DIR.mkdir(exist_ok=True)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")
+
 DTYPE = torch.float32
+
 
 # --- full determinism -------------------------------------------------------
 SEED = 42
@@ -46,6 +45,8 @@ RNG = default_rng(SEED)
 VAL_FRAC = 0.10               # validation split
 MAX_EPOCHS = 30               # upper bound during Optuna search
 PRINT_EVERY = 5
+
+FORCE_TRAIN = True
 
 # Particle-filter default (reduced) ------------------------------------------
 PF_PARTICLES = 5000            # 5 000 → 500 for ~10× speed-up
@@ -190,10 +191,10 @@ def build_split(N, mixed=False):
     return z_lap, bg_true
 
 
-files = {k: DATA_DIR / f"{k}.npz" for k in ("train_std", "train_mix", "test")}
+files = {k: DATA_DIR/ f"{k}.npz" for k in ("train_std", "train_mix", "test")}
 
 if all(p.exists() for p in files.values()):
-    print("✅ Found existing dataset files; loading …")
+    print("Found existing dataset files; loading …")
 
     def _load(path: Path):
         with np.load(path) as d:
@@ -203,7 +204,7 @@ if all(p.exists() for p in files.values()):
     z_train_mix, x_train_mix = _load(files["train_mix"])
     z_test, x_test = _load(files["test"])
 else:
-    print("⚙️  Dataset files missing; generating …")
+    print("Dataset files missing; generating …")
     z_train_std, x_train_std = build_split(200, mixed=False)
     z_train_mix, x_train_mix = build_split(200, mixed=True)
     z_test, x_test = build_split(200, mixed=False)
@@ -292,7 +293,7 @@ def kf_batch(K: torch.Tensor, z: torch.Tensor, Q: torch.Tensor):
     return est
 
 
-MSE = nn.MSELoss(reduction="sum")  # sum for weighted averages later
+MSE = nn.MSELoss(reduction="sum")
 
 
 def crop_batch(z, x, len_):
@@ -315,12 +316,14 @@ def batch_loss(net, z_b, x_b, grad_clip=None, opt=None):
         opt.step()
     return loss.item()
 
+
+
 # ---------------------------------------------------------------------------
 # 5.  Optuna hyper-parameter search
 # ---------------------------------------------------------------------------
 
-HIDDEN_OPTS = [8, 16, 32, 64]
-NLAYER_OPTS = [1, 2]
+HIDDEN_OPTS = [8, 16, 32, 64, 128, 256]
+NLAYER_OPTS = [1, 2, 3]
 ACT_OPTS = ["relu"]
 LR_RANGE = (1e-5, 1e-3)
 BATCH_OPTS = [32, 64, 128]
@@ -335,7 +338,6 @@ def make_loader(ds, bs, shuf):
         bs,
         shuffle=shuf,
         drop_last=False,
-        num_workers=0,  # safer across OS / Optuna forks
         pin_memory=auto_pin,
     )
 
@@ -361,8 +363,7 @@ def eval_val(net, dl):
 
 
 # --------------------------- Optuna objective ------------------------------
-
-def objective(trial):
+def objective(trial, ds):
     hp = {
         "hidden": trial.suggest_categorical("hidden", HIDDEN_OPTS),
         "layers": trial.suggest_categorical("layers", NLAYER_OPTS),
@@ -375,7 +376,7 @@ def objective(trial):
         "clip": trial.suggest_categorical("clip", CLIP_OPTS),
     }
 
-    tr_dl, val_dl = build_loaders(train_std_ds, hp["bs"])
+    tr_dl, val_dl = build_loaders(ds, hp["bs"])
     net = GainGRU(hp["hidden"], hp["layers"], hp["drop"], hp["act"]).to(DEVICE)
     opt_cls = optim.Adam if hp["opt"] == "adam" else optim.RMSprop
     opt = opt_cls(net.parameters(), lr=hp["lr"])
@@ -402,28 +403,30 @@ def objective(trial):
 @dataclass
 class Args:
     trials: int = 200
-    timeout: int = 18_000
+    timeout: int = 18000
     persist: bool = False
 
 
-def run_optimization(args: Args):
+def run_optimization(ds, study_name, args: Args):
     storage = "sqlite:///optuna_study.db" if args.persist else None
     study = optuna.create_study(
         direction="minimize",
-        pruner=optuna.pruners.MedianPruner(2),
         storage=storage,
         load_if_exists=True,
-        study_name="kalman_net",
+        study_name=study_name,
     )
+    # pass a lambda binding ds into objective
     study.optimize(
-        objective,
+        lambda t: objective(t, ds),
         n_trials=args.trials,
         timeout=args.timeout,
         show_progress_bar=True,
-        gc_after_trial=True,
+        gc_after_trial=True
     )
-    (OUTPUT_DIR / "best_hparams.json").write_text(json.dumps(study.best_params, indent=2))
+    
+    (OUTPUT_DIR / f"best_hparams_{study_name}.json").write_text(json.dumps(study.best_params, indent=2))
     return study.best_params
+
 
 
 def train_final(ds, hp):
@@ -458,13 +461,21 @@ def gru_filter(net, z_np):
     return est.cpu().numpy().reshape(-1)
 
 
+def sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def evaluate_test(net):
     net.eval()
-    start = time.perf_counter()
-    preds = [gru_filter(net, z) for z in z_test]
-    dur = time.perf_counter() - start
-    rmse = math.sqrt(np.mean((np.stack(preds) - x_test) ** 2))
-    return rmse, dur
+    sync()
+    t0 = time.perf_counter()
+    preds = [gru_filter(net,z) for z in z_test]
+    sync()
+    total = time.perf_counter()-t0
+    rmse = math.sqrt(np.mean((np.stack(preds)-x_test)**2))
+    return rmse, total, total/len(z_test)
+
 
 # ---------------------------------------------------------------------------
 # 7.  Scenario evaluation helpers
@@ -472,6 +483,7 @@ def evaluate_test(net):
 
 INIT_VECTORS = np.array(
     [
+        [5.0, 5.0, 74.0, 108.58, 0.0, 0.0],
         [5.5, 5.5, 81.4, 119.438, 0.0, 0.0],
         [4.5, 4.5, 66.6, 97.722, 0.0, 0.0],
         [6.0, 6.0, 88.8, 130.296, 0.0, 0.0],
@@ -481,29 +493,29 @@ INIT_VECTORS = np.array(
     ],
     np.float32,
 )
-INIT_LABELS = ["±10 % up", "±10 % down", "±20 % up", "±20 % down", "±30 % up", "±30 % down"]
+INIT_LABELS = ["Normal", "±10 % up", "±10 % down", "±20 % up", "±20 % down", "±30 % up", "±30 % down"]
 
 
 @torch.no_grad()
 def apply_kalmannet(net, z_np, x0_scalar):
-    z_mod = z_np.copy()
-    z_mod[0] = x0_scalar
-    z_t = torch.tensor(z_mod, dtype=DTYPE, device=DEVICE).unsqueeze(0).unsqueeze(-1)
+    z_adj = z_np.copy()
+    z_adj[0] = x0_scalar
+    z_t = torch.tensor(z_adj, dtype=DTYPE, device=DEVICE).unsqueeze(0).unsqueeze(-1)
     K = net(z_t).squeeze(0)
-    est = kf_batch(K.unsqueeze(0), torch.tensor(z_mod, dtype=DTYPE, device=DEVICE).unsqueeze(0), Q_mat)
-    return est.squeeze(0).cpu().numpy()
+    est = kf_batch(K.unsqueeze(0), z_t.squeeze(-1), Q_mat)
+    return est.squeeze(0).cpu().numpy(), z_adj
+
 
 
 def run_pf_sequence(z_np, x0_scalar, N=PF_PARTICLES, init_spread=0.5):
     """Simple SIR particle filter for 1-D BG state."""
-    pf = ParticleFilter(
-        N,
-        1,
+    pf = VectorizedParticleFilter(
+        N, 1,
         lambda x, w: x + w,
         lambda x, v: x + v,
-        lambda: np.random.normal(0.0, Q_STD, (1,)),
-        lambda: np.random.laplace(0.0, B_LAPLACE, (1,)),
-        lambda z, x: (1 / (2 * B_LAPLACE)) * np.exp(-abs(z - x[0]) / B_LAPLACE),
+        lambda: np.random.normal(0.0, Q_STD, (N, 1)),
+        lambda: np.random.laplace(0.0, B_LAPLACE, (N, 1)),
+        lambda z, x: (1 / (2 * B_LAPLACE)) * np.exp(-abs(z - x[:, 0]) / B_LAPLACE),
         init_particles=np.random.normal(x0_scalar, init_spread, size=(N, 1)),
     )
     est = np.empty_like(z_np)
@@ -518,21 +530,47 @@ def run_pf_sequence(z_np, x0_scalar, N=PF_PARTICLES, init_spread=0.5):
 # ---------------------------------------------------------------------------
 
 def plot_loss_curves(train_losses, val_losses, name="model"):
-    """Save PNG with training / validation loss curves."""
-    epochs = list(range(1, len(train_losses) + 1))
+    epochs = range(1, len(train_losses) + 1)
     plt.figure(figsize=(8, 5))
     plt.plot(epochs, train_losses, label="Training Loss")
     plt.plot(epochs, val_losses, label="Validation Loss")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.ylabel("Loss (MSE)")
     plt.title("Training & Validation Loss")
-    plt.ylim(0, 1)
-    plt.xlim(1, len(epochs))
+    plt.xlim(1, len(train_losses))
     plt.grid(True, alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"loss_{name}.png")
+    plt.savefig(OUTPUT_DIR / f"loss_{name}.png", dpi=150)
     plt.close()
+
+
+def load_best_hparams():
+    hp_path = OUTPUT_DIR / "best_hparams.json"
+    if hp_path.exists():
+        return json.loads(hp_path.read_text())
+    # Fallback: run optimisation once
+    return run_optimization(Args())
+
+def load_trained_knet(tag="standard"):
+    pth = OUTPUT_DIR / f"knet_{tag}.pth"
+    if not pth.exists():
+        return None  # caller may decide to train
+    chk = torch.load(pth, map_location=DEVICE)
+    hp = chk["hparams"]
+    net = GainGRU(hp["hidden"], hp["layers"], hp["drop"], hp["act"]).to(DEVICE)
+    net.load_state_dict(chk["state_dict"])
+    net.eval()
+    return net, hp
+
+
+def load_or_run(tag, ds):
+    hp_path = OUTPUT_DIR / f"best_hparams_{tag}.json"
+    if hp_path.exists():
+        return json.loads(hp_path.read_text())
+    else:
+        return run_optimization(ds, tag, Args())
+
 
 # ---------------------------------------------------------------------------
 # 9.  Main
@@ -540,60 +578,112 @@ def plot_loss_curves(train_losses, val_losses, name="model"):
 
 def main():
     print("Device:", DEVICE)
+    print("cwd       :", Path.cwd())
+    print("script dir:", Path(__file__).resolve().parent)
+    print("OUTPUT_DIR:", OUTPUT_DIR.resolve())
+    print("exists?   :", OUTPUT_DIR.exists())
 
-    # ---------------- hyper-parameter search -------------------------------
-    best_hp = run_optimization(Args())
+    best_std = load_or_run("standard", train_std_ds)
+    best_mix = load_or_run("mixed", train_mix_ds)
 
-    # ---------------- final training --------------------------------------
+    best_hps = {
+        "standard": best_std,
+        "mixed":    best_mix,
+    }
+
     models = {}
-    loss_histories = {}
-    for name, ds in {"standard": train_std_ds, "mixed": train_mix_ds}.items():
-        net, tr_losses, val_losses = train_final(ds, best_hp)
-        models[name] = net
-        loss_histories[name] = (tr_losses, val_losses)
+    for name, ds, best_hp in [("standard", train_std_ds, best_std), ("mixed", train_mix_ds, best_mix)]:
+        pth = OUTPUT_DIR / f"knet_{name}.pth"
+        retrain = FORCE_TRAIN or (not pth.exists())
 
+        if retrain:
+            print(f"Training {name} model from scratch...")
+            net, tr_losses, val_losses = train_final(ds, best_hp)
+
+            torch.save(
+                {"state_dict": net.state_dict(), "hparams": best_hp},
+                pth
+            )
+            plot_loss_curves(tr_losses, val_losses, name)
+            models[name] = net
+
+        else:
+            print(f"✅  Loading cached {name} model …")
+            chk = torch.load(pth, map_location=DEVICE)
+
+            net = GainGRU(
+                best_hp["hidden"],
+                best_hp["layers"],
+                best_hp["drop"],
+                best_hp["act"],
+            ).to(DEVICE)
+
+            net.load_state_dict(chk["state_dict"])
+            net.eval()
+
+            models[name] = net
+
+    print("start evaluation")
     # ---------------- evaluation & save ------------------------------------
     perf_records = []
     for name, net in models.items():
-        torch.save({"state_dict": net.state_dict(), "hparams": best_hp}, OUTPUT_DIR / f"knet_{name}.pth")
-        rmse, dur = evaluate_test(net)
-        perf_records.append((name, rmse, dur))
 
-    df_perf = pd.DataFrame(perf_records, columns=["Model", "RMSE", "Inference[s]"]).sort_values("RMSE")
+        hp = best_hps[name]
+
+        torch.save(
+            {"state_dict": net.state_dict(), "hparams": best_hp},
+            OUTPUT_DIR / f"knet_{name}.pth"
+        )
+        rmse, tot, per = evaluate_test(net)
+        perf_records.append((name, rmse, tot, per))
+
+    df_perf = pd.DataFrame(
+        perf_records,
+        columns=["Model", "RMSE", "InferenceTotal[s]", "PerSubject[s]"]
+    ).sort_values("RMSE")
     df_perf.to_csv(OUTPUT_DIR / "test_performance.csv", index=False)
     print("\n=== Test performance ===\n", df_perf.to_string(index=False))
 
-    # ---------------- loss curves -----------------------------------------
-    for name, (tr, val) in loss_histories.items():
-        plot_loss_curves(tr, val, name)
+    # (No more loss‐curve loop here)
 
     # ---------------- scenario analysis -----------------------------------
     best_name = df_perf.iloc[0, 0]
     best_net = models[best_name]
 
     scenario_rows = []
+    print("Scenario analysis")
+
     outer = tqdm(zip(INIT_LABELS, INIT_VECTORS), total=len(INIT_LABELS), desc="Scenarios")
     for label, vec in outer:
         x0_bg = float(vec[0])
 
-        # KalmanNet predictions ---------------------------
-        start = time.perf_counter()
-        kn_preds = [apply_kalmannet(best_net, z, x0_bg) for z in tqdm(z_test, leave=False)]
-        kn_time = time.perf_counter() - start
-        kn_rmse = math.sqrt(np.mean((np.stack(kn_preds) - x_test) ** 2))
+        # ---------- KalmanNet ----------
+        sync()
+        t0_kn = time.perf_counter()
+        kn_out = [apply_kalmannet(best_net, z, x0_bg) for z in z_test]
+        kn_preds, all_z_adj = zip(*kn_out)
+        sync()
+        kn_time = time.perf_counter() - t0_kn
+        kn_preds = np.stack(kn_preds)
+        kn_rmse = math.sqrt(np.mean((kn_preds - x_test) ** 2))
+        kn_avg  = kn_time / len(z_test)
 
-        # Particle filter predictions ---------------------
-        start = time.perf_counter()
-        pf_preds = [run_pf_sequence(z, x0_bg) for z in tqdm(z_test, leave=False)]
-        pf_time = time.perf_counter() - start
-        pf_rmse = math.sqrt(np.mean((np.stack(pf_preds) - x_test) ** 2))
+        # ---------- Particle Filter ----------
+        t0_pf = time.perf_counter()
+        pf_preds = [run_pf_sequence(z_adj, x0_bg) for z_adj in all_z_adj]
+        pf_time = time.perf_counter() - t0_pf
+        pf_preds = np.stack(pf_preds)
+        pf_rmse = math.sqrt(np.mean((pf_preds - x_test) ** 2))
+        pf_avg  = pf_time / len(z_test)
 
-        scenario_rows.append((label, kn_rmse, kn_time, pf_rmse, pf_time))
+        scenario_rows.append((label, kn_rmse, kn_time, kn_avg,
+                            pf_rmse, pf_time, pf_avg))
 
     df_scen = pd.DataFrame(
         scenario_rows,
-        columns=["Scenario", "KalmanNet_RMSE", "KalmanNet_s", "Particle_RMSE", "Particle_s"],
+        columns=["Scenario", "KN_RMSE", "KN_s", "KN_per_s", "PF_RMSE", "PF_s", "PF_per_s"],
     )
+
     df_scen.to_csv(OUTPUT_DIR / "scenario_comparison.csv", index=False)
 
     print("\n=== Scenario comparison ===")
@@ -601,11 +691,13 @@ def main():
         df_scen.to_string(
             index=False,
             formatters={
-                "KalmanNet_RMSE": "{:.4f}".format,
-                "KalmanNet_s": "{:.2f}".format,
-                "Particle_RMSE": "{:.4f}".format,
-                "Particle_s": "{:.2f}".format,
-            },
+                "KN_RMSE":    "{:.4f}".format,
+                "KN_s":       "{:.2f}".format,
+                "KN_per_s":   "{:.4f}".format,
+                "PF_RMSE":    "{:.4f}".format,
+                "PF_s":       "{:.2f}".format,
+                "PF_per_s":   "{:.4f}".format,
+            }
         )
     )
 

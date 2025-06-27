@@ -143,6 +143,96 @@ class ParticleFilter:
         return self.estimate()
 
 
+class VectorizedParticleFilter:
+    """
+    Same interface as before, but fully vectorized.
+    Assumes:
+      • f_func(x_prev, w) accepts x_prev of shape (N, m) and w of shape (N, m)
+         and returns an (N, m) array.
+      • meas_likelihood(z, x) accepts z as scalar or array of shape (N,)
+         and x as (N, m), returning an array of shape (N,) of likelihoods.
+    """
+
+    def __init__(self,
+                 N,
+                 dim_state,
+                 f_func,
+                 h_func,
+                 sample_process_noise,
+                 sample_meas_noise,
+                 meas_likelihood,
+                 init_particles=None,
+                 init_weights=None):
+        self.N = N
+        self.m = dim_state
+        self.f_func = f_func
+        self.h_func = h_func
+        self.sample_process_noise = sample_process_noise
+        self.sample_meas_noise = sample_meas_noise
+        self.meas_likelihood = meas_likelihood
+
+        # particles: shape (N, m)
+        if init_particles is not None:
+            p = init_particles.reshape(N, dim_state).astype(float)
+            assert p.shape == (N, dim_state)
+            self.particles = p.copy()
+        else:
+            self.particles = np.random.randn(N, dim_state)
+
+        # weights: shape (N,)
+        if init_weights is not None:
+            w = init_weights.astype(float)
+            w /= w.sum()
+            self.weights = w.copy()
+        else:
+            self.weights = np.ones(N) / N
+
+    def predict(self):
+        # draw one process‐noise sample per particle at once
+        # sample_process_noise() must now return an array of shape (N, m)
+        w = self.sample_process_noise()               # shape (N, m)
+        # propagate all particles in one go
+        self.particles = self.f_func(self.particles, w)  # shape (N, m)
+
+    def update(self, z):
+        # compute likelihoods for all particles at once
+        # meas_likelihood(z, self.particles) → shape (N,)
+        likelihoods = self.meas_likelihood(z, self.particles)
+
+        # update weights vectorized
+        self.weights = self.weights * likelihoods
+        self.weights += 1e-300        # avoid zeros
+        self.weights /= self.weights.sum()
+
+        # systematic resampling if needed
+        neff = 1.0 / np.sum(self.weights**2)
+        if neff < self.N / 2.0:
+            # cumulative sum
+            cdf = np.cumsum(self.weights)
+            # equally spaced pointers
+            positions = (np.arange(self.N) + np.random.random()) / self.N
+            # find indices via searchsorted
+            indexes = np.searchsorted(cdf, positions)
+            # resample
+            self.particles = self.particles[indexes]
+            self.weights = np.ones(self.N) / self.N
+
+    def estimate(self):
+        # weighted mean (shape (m,))
+        x_est = np.average(self.particles, axis=0, weights=self.weights)
+        # weighted covariance (m×m):
+        diffs = self.particles - x_est  # (N, m)
+        # (N, m, 1) * (N, 1, m) → (N, m, m), times weights[:, None, None]
+        cov = np.einsum('ni,nj,n->ij', diffs, diffs, self.weights)
+        return x_est.reshape(self.m, 1), cov
+
+    def step(self, z):
+        self.predict()
+        self.update(z)
+        return self.estimate()
+
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # 3) KalmanNetFilter (a Kalman + small NN hybrid)
 # ─────────────────────────────────────────────────────────────────────────
