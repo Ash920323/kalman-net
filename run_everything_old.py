@@ -50,7 +50,7 @@ params = {
 }
 
 
-output_dir = Path.cwd() / "run_for_plot"
+output_dir = Path.cwd() / "run_0"
 output_dir.mkdir(exist_ok=True)
 
 def D_of_t(t_min):
@@ -628,9 +628,6 @@ H   = torch.tensor([[1.0]],  dtype=torch.float32, device=DEVICE)
 EYE = torch.eye(1, device=DEVICE)
 MSE = nn.MSELoss()
 
-z_test, x_test = test_ds.z.numpy(), test_ds.x.numpy()
-
-
 def run_filter_through_net(net: nn.Module, z_seq: torch.Tensor):
     """Rollout a 1‑D Kalman filter using NN‑predicted gains."""
     K_seq = net(z_seq).squeeze(0)
@@ -647,21 +644,117 @@ def run_filter_through_net(net: nn.Module, z_seq: torch.Tensor):
         est.append(x_hat.view(-1))
     return torch.stack(est).squeeze()
 
+PARAM_GRID = {
+    "hidden_size": [16],
+    "num_layers" : [1, 2],
+    "lr"         : [3e-4, 1e-4],
+    "dropout"    : [0.0],
+    "grad_clip"  : [0.5, 1.0],
+    "epochs"     : [4],   # short while searching
+}
+print(f"Grid size = {np.prod([len(v) for v in PARAM_GRID.values()])} trials")
+
+
+def build_loaders(ds: GlucoseDataset):
+    val_sz = int(len(ds)*VAL_FRAC)
+    train_sz = len(ds) - val_sz
+    train_ds, val_ds = random_split(ds, [train_sz, val_sz], generator=torch.Generator().manual_seed(42))
+    train_dl = DataLoader(train_ds, batch_size=BATCH_SZ, shuffle=True, drop_last=False)
+    val_dl   = DataLoader(val_ds,   batch_size=BATCH_SZ, shuffle=False, drop_last=False)
+    return train_dl, val_dl
 
 def batch_loss(net, z_b, x_b, grad_clip=None, opt=None):
-    B, T = z_b.shape
-    loss = 0.0
+    B, T = z_b.shape; loss = 0.0
     for b in range(B):
-        est = run_filter_through_net(net, z_b[b].view(1, T, 1))
+        est = run_filter_through_net(net, z_b[b].view(1,T,1))
         loss += MSE(est, x_b[b])
     loss /= B
     if opt is not None:
-        opt.zero_grad()
-        loss.backward()
+        opt.zero_grad(); loss.backward()
         if grad_clip is not None:
             nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
         opt.step()
     return loss.item()
+
+train_dl_search, val_dl_search = build_loaders(train_std_ds)
+
+search_space = list(itertools.product(*PARAM_GRID.values()))
+results = []
+start = time.perf_counter()
+for i, combo in enumerate(search_space, 1):
+    hp = dict(zip(PARAM_GRID.keys(), combo))
+    net = GainGRU(hp["hidden_size"], hp["num_layers"], hp["dropout"]).to(DEVICE)
+    opt = optim.Adam(net.parameters(), lr=hp["lr"])
+    for _ in range(hp["epochs"]):
+        net.train()
+        for z_b, x_b in train_dl_search:
+            batch_loss(net, z_b.to(DEVICE), x_b.to(DEVICE), hp["grad_clip"], opt)
+    # validation
+    net.eval(); val_mse = 0.0
+    with torch.no_grad():
+        for z_b, x_b in val_dl_search:
+            val_mse += batch_loss(net, z_b.to(DEVICE), x_b.to(DEVICE))
+    val_mse /= len(val_dl_search)
+    results.append((val_mse, hp))
+    print(f"Trial {i:02d}/{len(search_space)} | val MSE = {val_mse:.4f} | {hp}")
+
+best_val, best_hp = min(results, key=lambda t: t[0])
+print("\n🏆 Best grid‑search config:", best_hp, "| val MSE =", f"{best_val:.4f}")
+json.dump({"results": results, "best": best_hp}, open(RESULTS_DIR/"grid_search_results.json","w"), indent=2)
+print("Grid‑search JSON saved ✔️")
+
+train_dl_tune, val_dl_tune = build_loaders(train_std_ds)
+
+hp = {k:v for k,v in best_hp.items() if k!="epochs"}
+net = GainGRU(hp["hidden_size"], hp["num_layers"], hp["dropout"]).to(DEVICE)
+opt = optim.Adam(net.parameters(), lr=hp["lr"])
+
+val_curve = []
+best_epoch, best_val = 0, float("inf")
+for ep in range(1, MAX_EPOCHS+1):
+    net.train()
+    for z_b, x_b in train_dl_tune:
+        batch_loss(net, z_b.to(DEVICE), x_b.to(DEVICE), hp["grad_clip"], opt)
+    # validation
+    net.eval(); val_mse = 0.0
+    with torch.no_grad():
+        for z_b, x_b in val_dl_tune:
+            val_mse += batch_loss(net, z_b.to(DEVICE), x_b.to(DEVICE))
+    val_mse /= len(val_dl_tune)
+    val_curve.append(val_mse)
+    if val_mse < best_val:
+        best_val, best_epoch = val_mse, ep
+    print(f"Epoch {ep:02d} — val MSE: {val_mse:.4f}")
+
+plt.figure(figsize=(6,3))
+plt.plot(range(1, MAX_EPOCHS+1), val_curve, marker='o')
+plt.xlabel("Epoch"); plt.ylabel("Validation MSE"); plt.title("Epoch Tuning")
+plt.grid(True); plt.tight_layout()
+plt.savefig(RESULTS_DIR/"epoch_tuning_curve.png")
+plt.savefig(RESULTS_DIR/"epoch_tuning_curve.png")
+plt.close()
+
+json.dump({"best_epoch": best_epoch}, open(RESULTS_DIR/"best_epoch.json","w"))
+print(f"🏁 Best #epochs = {best_epoch} | val MSE = {best_val:.4f}")
+
+hp_epochs = hp | {"epochs": best_epoch}
+loaders = {
+    "standard": DataLoader(train_std_ds, batch_size=BATCH_SZ, shuffle=True, drop_last=False),
+    "mixed":    DataLoader(train_mix_ds, batch_size=BATCH_SZ, shuffle=True, drop_last=False)
+}
+final_models = {}
+for name, dl in loaders.items():
+    print(f"\nTraining {name.upper()} model …")
+    net = GainGRU(hp["hidden_size"], hp["num_layers"], hp["dropout"]).to(DEVICE)
+    opt = optim.Adam(net.parameters(), lr=hp["lr"])
+    for _ in range(best_epoch):
+        net.train()
+        for z_b, x_b in dl:
+            batch_loss(net, z_b.to(DEVICE), x_b.to(DEVICE), hp["grad_clip"], opt)
+    final_models[name] = net
+print("Final models trained ✔️")
+
+z_test, x_test = test_ds.z.numpy(), test_ds.x.numpy()
 
 def gru_filter(net: nn.Module, z_np: np.ndarray):
     net.eval()
@@ -676,80 +769,6 @@ def evaluate(net):
     inf_time = time.perf_counter()-start
     rmse = np.sqrt(((np.stack(preds)-x_test)**2).mean())
     return rmse, inf_time
-
-# 1) Hard-coded hyperparameters from your table
-hp = {
-    "standard": {
-        "hidden_size": 64,
-        "num_layers":  1,
-        "dropout":     0.672,
-        "lr":          9.15e-4,
-        "grad_clip":   0.5,
-        "batch_size":  32,
-    },
-    "mixed": {
-        "hidden_size": 256,
-        "num_layers":  1,
-        "dropout":     0.777,
-        "lr":          3.40e-4,
-        "grad_clip":   1.0,
-        "batch_size":  32,
-    },
-}
-
-NUM_EPOCHS = 50 
-
-# 2) Train one model per split
-final_models = {}
-for split_name, ds in [("standard", train_std_ds), ("mixed", train_mix_ds)]:
-    cfg = hp[split_name]
-    print(f"\nTraining {split_name.upper()} model …")
-    net = GainGRU(cfg["hidden_size"], cfg["num_layers"], cfg["dropout"]).to(DEVICE)
-    opt = optim.Adam(net.parameters(), lr=cfg["lr"])
-    loader = DataLoader(ds, batch_size=cfg["batch_size"], shuffle=True, drop_last=False)
-
-    for ep in range(1, NUM_EPOCHS+1):
-        net.train()
-        epoch_loss = 0.0
-        for z_b, x_b in loader:
-            epoch_loss += batch_loss(net, z_b.to(DEVICE), x_b.to(DEVICE),
-                                     cfg["grad_clip"], opt)
-        epoch_loss /= len(loader)
-        print(f"  Epoch {ep:02d}/{NUM_EPOCHS} — loss = {epoch_loss:.4f}")
-
-    final_models[split_name] = net
-
-print("\n✔️  All models trained!")
-
-# 3) Run both filters on the original simulated trace
-pf_pred = est_laplace
-kn_pred = gru_filter(final_models["standard"], bg_laplace_noisy)
-
-# 4) Two‐panel comparison plot
-fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
-
-# Panel 1: Particle Filter
-ax1.plot(time_hours, bg_laplace_noisy, color="0.8", label="Noisy", linewidth=1)
-ax1.plot(time_hours, bg_true,          'k--',       label="True",  linewidth=1.5)
-ax1.plot(time_hours, pf_pred,                      label="PF",    linewidth=1.5)
-ax1.set_ylabel("BG [mM]")
-ax1.set_title("Particle Filter")
-ax1.legend(loc="upper right")
-
-# Panel 2: KalmanNet (standard)
-ax2.plot(time_hours, bg_laplace_noisy, color="0.8", label="Noisy", linewidth=1)
-ax2.plot(time_hours, bg_true,          'k--',       label="True",  linewidth=1.5)
-ax2.plot(time_hours, kn_pred,                     label="KalmanNet", linewidth=1.5)
-ax2.set_xlabel("Time [h]")
-ax2.set_ylabel("BG [mM]")
-ax2.set_title("KalmanNet (standard)")
-ax2.legend(loc="upper right")
-
-plt.tight_layout()
-plt.savefig(output_dir/"comparison_pf_vs_kn.png")
-plt.show()
-
-
 
 print("\n============== Performance ==============")
 for name, model in final_models.items():
